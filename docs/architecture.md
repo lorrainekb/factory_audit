@@ -1,471 +1,581 @@
-# Design Decisions
+# Factory Audit System – Architecture
 
-This document explains the "why" behind key architectural choices.
+## Problem Statement
 
-## Decision 1: Event Sourcing Over Mutable State
+A factory has 30 shared devices on the floor. Workers clock in and out of production jobs throughout a shift. Devices go offline regularly. Workers hand devices to each other mid-session. Supervisors need an accurate, auditable record of who worked on what and for how long, and that record must be trustworthy even when things went wrong.
 
-**Choice:** Store immutable events; derive current state from them.
+## Core Design Principle
 
-**Not:** Store a "current_worker_session" table with mutable state.
+**The source of truth is the immutable event log, not a mutable "current state" table.**
 
-### Why This Decision?
-
-The spec explicitly requires:
-> "The audit trail must be immutable: past events cannot be altered, only appended to."
-
-Event sourcing makes this a first-class architectural pattern, not an afterthought.
-
-### Tradeoff
-
-**Pros:**
-- Immutability is baked in
-- Audit trail is the source of truth
-- Replay is possible (for debugging)
-- No accidental mutation of history
-
-**Cons:**
-- Slightly more code for projections
-- Current state must be calculated each time
-- Slightly more complex to reason about initially
-
-**Verdict:** For an audit system, the pros massively outweigh the cons. Current state is secondary; audit trail is primary.
-
----
-
-## Decision 2: Preserve Conflicts Instead of Preventing Them
-
-**Choice:** Accept all structurally valid events, even if they conflict logically.
-
-**Not:** Reject events that would create conflicts.
-
-### Why This Decision?
-
-In an offline-first system, you cannot prevent conflicts. Here's why:
-
+Instead of storing:
 ```
-Device A (offline):  Worker 5 starts Job 10 @ 09:00
-Device B (offline):  Worker 5 starts Job 11 @ 09:05
-
-At this moment:
-- Device A has no way to know about Device B's start
-- Device B has no way to know about Device A's start
-- Both devices are offline; no server to ask
-
-Both devices are right, from their perspective.
-Both events are true.
+worker 14 is currently on job 88
 ```
 
-Attempting to prevent this would require:
-- Real-time connectivity (not guaranteed)
-- A central authority checking state before every action (offline-unfriendly)
-- A false sense of security (which contradicts the spec)
-
-### Tradeoff
-
-**Pros:**
-- Offline-first design is clean and simple
-- Every device observation is preserved
-- Auditability is maintained even under failure
-- Supervisors see actual reality (not sanitized version)
-
-**Cons:**
-- Some conflicts make it to the supervisor inbox
-- Requires supervisor review workflow
-- Feels less "clean" than auto-resolution
-
-**Verdict:** For a *trustworthy* audit system, preserving conflicts is the only honest choice. The alternative is false certainty.
-
----
-
-## Decision 3: Sessions Are Derived, Not Stored
-
-**Choice:** A session is just a pair of WORK_STARTED / WORK_STOPPED events sharing a session_id.
-
-**Not:** A separate "sessions" table with mutable state.
-
-### Why This Decision?
-
-Storing sessions separately creates redundancy:
-
+We store:
 ```
-Option A (Separate Table):
-  events table: WORK_STARTED
-  events table: WORK_STOPPED
-  sessions table: { session_id, worker_id, job_id, start_time, end_time, duration }
-  ^ This duplicates information already in events
-
-Option B (Derived):
-  events table: WORK_STARTED, WORK_STOPPED
-  ^ Calculate session details from these on read
+WORK_STARTED: worker 14, job 88, 09:03, device D-07
+WORK_STOPPED: worker 14, job 88, 10:11, device D-07
+WORK_STARTED: worker 14, job 91, 10:14, device D-11
 ```
 
-With Option A, you must keep two tables in sync. If your conflict detection updates a session's state, now you have mutable audit data (violates spec).
+This ensures:
+- Immutability (past events cannot be altered)
+- Auditability (every claim is preserved)
+- Offline-first capability (events are captured locally first)
+- Conflict visibility (contradictions are preserved, not hidden)
 
-With Option B, there's one source of truth: the events. Sessions are read models, not write models.
+## System Architecture
 
-### Tradeoff
+```
+┌──────────────────────────┐
+│     Flutter App          │
+│  (Worker & Supervisor)   │
+└──────────┬───────────────┘
+           │
+           │ read/write
+           ▼
+┌──────────────────────────┐
+│    Local SQLite DB       │
+│  (Offline Event Queue)   │
+└──────────┬───────────────┘
+           │
+           │ sync batch
+           ▼
+┌──────────────────────────┐
+│    Backend API           │
+│  (Event Ingestion)       │
+└──────────┬───────────────┘
+           │
+           │ append-only
+           ▼
+┌──────────────────────────┐
+│   Server Database        │
+│  (Canonical Event Log)   │
+└──────────────────────────┘
+```
 
-**Pros:**
-- Single source of truth
-- No sync burden between tables
-- If conflict detection improves, all projections automatically improve
+### Layer 1: Flutter App
+
+**Responsibilities:**
+- Worker selection
+- Job selection
+- Start/stop work
+- Device handoff representation
+- Sync trigger (manual "Sync Now" button)
+
+**Not responsible for:**
+- Conflict resolution
+- Business logic beyond event creation
+- Authentication (out of scope)
+
+### Layer 2: Local SQLite Database
+
+**Responsibilities:**
+- Capture events locally (pending_sync = true)
+- Persist events across app restarts
+- Maintain sync queue
+- Derive local "active session" state for UI
+
+**Not responsible for:**
+- Authoritative state
+- Conflict detection (that's server-side)
+
+### Layer 3: Backend API
+
+**Responsibilities:**
+- Accept event batches from devices
+- Validate event structure (reject malformed)
+- Deduplicate by event_id (idempotency)
+- Append all valid events to immutable log
+- Detect and flag conflicts post-sync
+- Build read models (projections)
+
+**Not responsible for:**
+- Preventing conflicts (they're offline anyway)
+- Auto-resolving conflicts
+- Permission checks
+- Worker identity verification
+
+### Layer 4: Server Database
+
+**Responsibilities:**
+- Store events immutably (never update/delete)
+- Store derived conflict records
+- Store session projections
+- Maintain audit trail
+
+## Core Entities
+
+### EventRecord
+
+An immutable claim about what happened on a device.
+
+```
+event_id:              UUID
+device_id:             which device
+worker_id:             who performed the action
+job_id:                which job (nullable for some events)
+session_id:            groups start/stop pairs
+event_type:            WORK_STARTED | WORK_STOPPED | DEVICE_HANDOFF
+occurred_at:           device timestamp (user's local time)
+recorded_locally_at:   when device recorded it
+synced_at:             when server acknowledged it
+payload:               JSON metadata
+sync_status:           pending | inflight | synced | failed | duplicate
+```
+
+**Why this shape:**
+- `event_id` ensures idempotency
+- `occurred_at` + `recorded_locally_at` preserve device perspective
+- `synced_at` proves server receipt
+- `session_id` groups related events without needing a separate sessions table
+- `sync_status` tracks delivery state locally
+
+### ConflictRecord
+
+Flagged when two or more events contradict each other.
+
+```
+conflict_id:           UUID
+conflict_type:         WORKER_OVERLAP | DEVICE_OVERLAP | STOP_WITHOUT_START
+worker_id:             worker involved
+device_id:             device involved (if applicable)
+related_event_ids:     which events caused this
+detected_at:           when server detected it
+status:                open | reviewed | resolved
+details:               JSON explanation
+```
+
+**Why separate from events:**
+- Conflicts are *derived* (read model), not source of truth
+- Preserves original events unchanged
+- Allows supervisor review workflow
+- Makes conflict detection testable
+
+### SessionProjection
+
+Derived summary of start/stop pairs.
+
+```
+session_id:            UUID
+worker_id:             who worked
+job_id:                what they worked on
+start_time:            when it began
+end_time:              when it ended
+duration_seconds:      calculated
+state:                 open | closed | invalid
+trust_status:          trusted | disputed
+```
+
+**Why derived:**
+- No redundancy with raw events
+- Recalculated on every projection build
+- If conflict detection improves, projections automatically improve
+
+## Event Types (MVP)
+
+Only two required:
+
+- `WORK_STARTED(worker_id, job_id, device_id, session_id, occurred_at)`
+- `WORK_STOPPED(worker_id, job_id, device_id, session_id, occurred_at)`
+
+Optional future:
+- `DEVICE_HANDOFF_RECORDED` — explicit handoff event (but not needed for MVP; just stop + start)
+
+**Why minimal:**
 - Simpler to reason about
-
-**Cons:**
-- Must calculate sessions on every read (minor performance cost)
-- Requires more code for projections
-
-**Verdict:** For an immutable audit system, derived state is the correct pattern.
-
----
-
-## Decision 4: Two Timestamps Per Event
-
-**Choice:** Store both `occurred_at` (device time) and `recorded_at_server_time` (server receipt).
-
-**Not:** Just use server time.
-
-### Why This Decision?
-
-These timestamps serve different audit purposes:
-
-- `occurred_at` = what the worker experienced ("I started at 9:00 AM")
-- `recorded_at_server_time` = when the audit trail registered the claim ("server received this at 10:15 AM")
-
-Example conflict analysis:
-
-```
-Worker claims they started Job A at 09:00 on Device 1.
-Worker also claims they started Job B at 09:05 on Device 2.
-Device 2 was offline until 10:30, then synced.
-
-Timeline (device times):
-  09:00 Job A starts
-  09:05 Job B starts
-
-Timeline (server times):
-  09:15 Job A claim received
-  10:30 Job B claim received
-
-With only server times, you lose the information that both starts happened ~5 minutes apart in the worker's experience.
-With both timestamps, you preserve the full picture.
-```
-
-This matters for supervisor review. A supervisor might think: "Device 2 was offline at 09:05. Device 1 was online. That explains why we didn't prevent the conflict."
-
-### Tradeoff
-
-**Pros:**
-- Richer audit picture
-- Better supervisor understanding
-- Good for forensics
-
-**Cons:**
-- Slightly more complex timestamp handling
-- Must account for clock drift
-
-**Verdict:** Worth the complexity. Audit trails benefit from preserving multiple perspectives.
-
----
-
-## Decision 5: Three Conflict Types (Not One Catch-All)
-
-**Choice:** Define specific conflict types: WORKER_OVERLAP, DEVICE_OVERLAP, STOP_WITHOUT_START.
-
-**Not:** Generic "conflict" flag.
-
-### Why This Decision?
-
-Different conflicts have different meanings:
-
-**WORKER_OVERLAP:**
-- Same worker, two simultaneous jobs
-- Suggests: worker forgot to stop first job, or was cloned across devices
-
-**DEVICE_OVERLAP:**
-- Same device, two different workers simultaneously
-- Suggests: device handoff went wrong; previous worker didn't stop before handing over
-
-**STOP_WITHOUT_START:**
-- Stop event with no matching start
-- Suggests: data corruption or app crash during start
-
-Each type points to a different type of failure, and supervisors need to know which.
-
-### Tradeoff
-
-**Pros:**
-- Supervisor gets actionable diagnosis
-- Easier to write rules per type
-- Extensible for future conflict types
-
-**Cons:**
-- Slightly more complex detection logic
-- More things to test
-
-**Verdict:** Small complexity cost for much better observability.
-
----
-
-## Decision 6: Manual Sync ("Sync Now" Button) Over Background Sync
-
-**Choice:** App has explicit "Sync Now" button. No background sync (for MVP).
-
-**Not:** Automatic background sync on connectivity.
-
-### Why This Decision?
-
-Background sync is seductive but adds complexity:
-
-```
-Background sync logic:
-  - Detect connectivity changes
-  - Debounce rapid changes
-  - Handle sync failure without UI
-  - Retry logic
-  - User notification of conflict detection post-sync
-```
-
-For an MVP focused on demonstrating trustworthiness, a manual sync button is much clearer:
-
-```
-Manual sync logic:
-  - User taps "Sync Now"
-  - Events are sent
-  - Response is shown (conflicts, errors, accepted count)
-  - Done
-```
-
-The demo walkthrough becomes much easier to control and explain.
-
-### Tradeoff
-
-**Pros:**
-- Explicit and testable
-- User has visibility and control
-- Easier to demo conflict detection
+- Easier to test
 - Fewer edge cases
+- Can expand later
 
-**Cons:**
-- Requires user action (less convenient)
-- Possible to forget to sync
+## Offline-First Behavior
 
-**Verdict:** For MVP, explicit beats implicit. Real product could add background sync later without changing the core design.
+### When Device Is Offline
 
----
+1. User taps "Start Work"
+2. App creates EventRecord locally
+3. App inserts into SQLite with `sync_status = pending`
+4. UI updates immediately from local data
+5. No network call attempted
+6. Event survives app restart (persisted in SQLite)
 
-## Decision 7: SQLite (Not Firebase Firestore)
+### When Device Comes Online
 
-**Choice:** SQLite locally on device. Custom backend for server-side event store.
+1. App detects connectivity
+2. Collects all events where `sync_status = pending`
+3. Sends POST /events/batch with event array
+4. Server appends them to event log
+5. Server returns `{ accepted: [...], duplicates: [...], rejected: [...] }`
+6. App marks those rows as `sync_status = synced`
+7. If a retry is needed, same event_id is idempotent (server ignores duplicate)
 
-**Not:** Firebase / Firestore for everything.
+**Key principle:** Events are facts once created locally. Sync doesn't mutate them; it just broadcasts them.
 
-### Why This Decision?
+## Sync Model
 
-Firebase is tempting because it handles sync automatically. But for this problem:
+### Idempotency
 
-**SQLite Pros:**
-- Explicit, simple sync model (batch HTTP)
-- Easy to implement idempotency (by event_id)
-- No vendor lock-in
-- Clear data model (relational)
-- Easy to demonstrate "immutable append-only" pattern
-- Good for showing architectural thinking
-
-**Firestore Cons:**
-- Sync model is less visible (automatic)
-- Conflict resolution is implicit (last-write-wins or custom rules)
-- Harder to demonstrate "events are immutable"
-- More of a black box; harder to explain to interviewer
-
-For an interview focused on architectural judgment, demonstrating a clear, explicit sync model beats speed.
-
-### Tradeoff
-
-**Pros:**
-- Shows deep architectural thinking
-- Full control over sync and conflict logic
-- Easier to explain in walkthrough
-- Good for teaching
-
-**Cons:**
-- More code to write
-- Sync is manual, not automatic
-- Slightly slower to build
-
-**Verdict:** Right choice for this interview context. Different decision if this were a real product.
-
----
-
-## Decision 8: No Authentication (MVP)
-
-**Choice:** Worker selection is a simple dropdown. No login.
-
-**Not:** Full auth system.
-
-### Why This Decision?
-
-Auth is a distraction from the core problem.
-
-The spec focuses on:
-- Offline capability ✓
-- Immutable audit trail ✓
-- Conflict handling ✓
-
-Auth would add:
-- Database schema for users
-- Password management or SSO integration
-- Permissions logic
-- Session management
-
-None of that affects your ability to demonstrate offline-first, event-sourced, conflict-aware design.
-
-### Tradeoff
-
-**Pros:**
-- Focus on core problem
-- Faster build
-- Cleaner demo
-
-**Cons:**
-- Less production-like
-- Anyone can select any worker (data integrity risk)
-
-**Verdict:** Acceptable for MVP. Mention in assumptions: "Workers are selected via dropdown; production would add auth."
-
----
-
-## Decision 9: Simple Backend Over Fancy Architecture
-
-**Choice:** Straightforward Node.js + Express or similar. Simple sync endpoint.
-
-**Not:** CQRS, Event Store library, complex async patterns.
-
-### Why This Decision?
-
-Fancy patterns can look smart but add noise:
+By `event_id`, the sync is idempotent:
 
 ```
-Option A (Fancy):
-  - Event store library (EventStoreDB, Axon, etc.)
-  - CQRS pattern
-  - Event bus / pub-sub
-  - Saga patterns
-  - Complex deploy setup
+Device sends: [event_1, event_2, event_3]
+Server receives, appends all three.
+Response: { accepted: [uuid1, uuid2, uuid3], duplicates: [], rejected: [] }
 
-Option B (Simple):
-  - One "events" table
-  - One "conflicts" table
-  - Simple endpoint that appends and detects
-  - Standard relational DB
+Device retries same batch (network glitch):
+Server receives same events again.
+Response: { accepted: [], duplicates: [uuid1, uuid2, uuid3], rejected: [] }
+
+App marks the duplicate event_ids as synced (idempotent).
 ```
 
-Option B is more humble, more testable, and clearer to explain.
+### Sync Failure Handling
 
-### Tradeoff
+If POST /events/batch fails:
+- Mark events as `sync_status = failed`
+- Retry on next connectivity check
+- Do NOT discard the events
+- Do NOT mutate them
 
-**Pros:**
-- Faster to build
-- Easier to debug
-- Easier to explain
-- Fewer dependencies
+## Conflict Detection Strategy
 
-**Cons:**
-- Doesn't show knowledge of fancy patterns
-- Less scalable (but not required for MVP)
+### Rule 1: Worker Overlap
 
-**Verdict:** Humility scores higher than cleverness in interviews. Show you can build something that works and you understand why.
+A worker should not have more than one active session simultaneously.
 
----
+**Detection:**
+```
+For each worker:
+  Sort events by recorded_at_server_time (canonical audit order)
+  Track open sessions (start without matching stop)
+  If a WORK_STARTED arrives while another session is open:
+    Create CONFLICT of type WORKER_OVERLAP
+    Mark both sessions as disputed
+```
 
-## Decision 10: Supervisor Visibility Over Conflict Resolution
+**Important:** We sort by server time because that's the canonical order in which claims arrived at the audit system. However, we preserve `occurred_at` so supervisors can see what the worker *experienced* vs. what the server *recorded*.
 
-**Choice:** Show conflicts. Do not attempt to auto-resolve or provide workflow for resolution.
+**Example:**
+```
+Device A (offline): Worker 5 WORK_STARTED Job 10 
+  Device time: 09:00, Server received: 09:15
 
-**Not:** Implement full conflict resolution workflow.
+Device B (offline): Worker 5 WORK_STARTED Job 11 
+  Device time: 09:05, Server received: 09:25
 
-### Why This Decision?
+Neither device has WORK_STOPPED before the other start.
 
-Full resolution would require:
-- Rules for choosing one event over another (which rule is right?)
-- Supervisor review and approval
-- Audit trail of the resolution itself
-- Rollback capability
+When sorted by recorded_at_server_time (09:15 → 09:25):
+  Job 10 started first (server's perspective)
+  Job 11 started second (server's perspective)
+  Overlap detected between 09:25 and when Job 10 stops
 
-That's a whole system inside the system.
+Creates CONFLICT: WORKER_OVERLAP with both events.
+Supervisor sees:
+  - Both events in canonical order (by server time)
+  - Device times preserved (what worker experienced)
+  - Overlap is clear
+```
 
-For MVP, the core claim is: "The system preserves truth and flags contradiction."
+### Rule 2: Device Overlap
 
-Resolving contradiction is the supervisor's job, not the system's.
+A device should not be used in overlapping sessions by different workers.
 
-### Tradeoff
+**Detection:**
+```
+For each device:
+  Sort events by recorded_at_server_time (canonical audit order)
+  Track open sessions
+  If a WORK_STARTED for worker B arrives (in server time) before worker A's session ends:
+    Create CONFLICT of type DEVICE_OVERLAP
+```
 
-**Pros:**
-- Simpler scope
-- Clearer responsibility boundary
-- Honest about what system can do
+**Example:**
+```
+Device 1:
+  Worker A WORK_STARTED Job 10 
+    Device time: 09:00, Server received: 09:10
+  Worker B WORK_STARTED Job 11 
+    Device time: 09:10, Server received: 09:20
+    (before A stops)
 
-**Cons:**
-- Supervisor must manually handle conflicts
-- Not a complete "solution"
+When sorted by recorded_at_server_time (09:10 → 09:20):
+Server detects B starting before A stopped.
 
-**Verdict:** This is a good scope boundary. You show you know where the hard problem is (resolution) and deliberately don't solve it for MVP.
+Conflict: DEVICE_OVERLAP
+Indicates device handoff went wrong (A didn't stop before B took device).
 
----
+Supervisor sees both device times and server times, understands the sequence.
+```
 
-## Where AI Led Me Wrong (Honest Reflection)
+### Rule 3: Stop Without Start
 
-During design exploration, I considered:
+A WORK_STOPPED event with no matching WORK_STARTED is suspicious.
 
-### Suggestion 1: "Maybe you could auto-resolve overlaps by keeping the first event?"
+**Detection:**
+```
+For each WORK_STOPPED event (ordered by recorded_at_server_time):
+  Check if a matching WORK_STARTED exists in the same session
+  Within the same device and worker
+  If not, create CONFLICT of type STOP_WITHOUT_START
+```
 
-**Why it sounded good:**
-- Feels clean
-- Gives the appearance of a complete system
-- Less work for supervisors
+**Why this matters:**
+- Indicates data corruption or app crash
+- Device thinks a session ended, but no record of it starting
+- May indicate network glitch during initial sync
 
-**Why it was wrong:**
-- Silently overwrites device observation
-- Violates "immutable audit trail"
-- If the rule is wrong, you've corrupted history
-- Can't be undone
+### Key Decision: Preserve, Don't Reject
 
-**How I caught it:**
-- Compared against the spec: "past events cannot be altered"
-- Realized auto-resolution is a form of alteration
-- Decided: preservation is more trustworthy than automatic resolution
+**The system accepts all structurally valid events, even if they conflict logically.**
 
-### Suggestion 2: "You could store 'current_active_session' as a mutable record for performance"
+Why?
+- Offline devices record truth as they see it
+- Later, different truths may arrive from other devices
+- Rejecting one device's claim destroys auditability
+- Better to preserve both and flag the contradiction
+- Supervisor can review and decide
 
-**Why it sounded good:**
-- Faster queries
-- Easier to check "is worker currently active?"
-- Feels more like traditional DB design
+**This is the hardest design decision.** Auto-resolving conflicts feels cleaner, but it silently overwrites device observations. For an audit system, that's a violation of trust.
 
-**Why it was wrong:**
-- Creates redundancy with events
-- Introduces mutation into audit data
-- Sync burden between two tables
-- If they diverge, which is truth?
+## Database Design
 
-**How I caught it:**
-- Realized this is derivable state, not source of truth
-- Recognized the redundancy risk
-- Decided: derive from events, accept the query cost
+### Local SQLite (Device)
 
----
+```sql
+CREATE TABLE workers (
+  worker_id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  employee_code TEXT
+);
 
-## Summary
+CREATE TABLE jobs (
+  job_id TEXT PRIMARY KEY,
+  job_code TEXT NOT NULL,
+  job_name TEXT NOT NULL
+);
 
-These decisions are tied together:
+CREATE TABLE events_local (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id TEXT NOT NULL UNIQUE,
+  device_id TEXT NOT NULL,
+  worker_id TEXT NOT NULL,
+  job_id TEXT,
+  session_id TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  occurred_at TEXT NOT NULL,
+  recorded_locally_at TEXT NOT NULL,
+  payload_json TEXT,
+  sync_status TEXT NOT NULL DEFAULT 'pending',
+  synced_at TEXT
+);
 
-1. **Events are immutable** (spec requirement)
-2. **Therefore conflicts are preserved** (offline reality)
-3. **Therefore sessions are derived** (no mutation)
-4. **Therefore timestamps are dual** (preserve context)
-5. **Therefore sync is explicit** (show the process)
-6. **Therefore backend is simple** (show the thinking)
-7. **Therefore no auth** (scope focus)
-8. **Therefore supervisor reviews conflicts** (honest boundary)
+CREATE INDEX idx_sync_status ON events_local(sync_status);
+CREATE INDEX idx_worker_id ON events_local(worker_id);
+CREATE INDEX idx_session_id ON events_local(session_id);
+```
 
-This coherence is what makes the system defensible, not the individual choices.
+### Server Database (Simple SQLite)
+
+For MVP, a simple SQLite database on the backend is sufficient and easiest to manage.
+
+```sql
+CREATE TABLE events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id TEXT NOT NULL UNIQUE,
+  device_id TEXT NOT NULL,
+  worker_id TEXT NOT NULL,
+  job_id TEXT,
+  session_id TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  occurred_at TEXT NOT NULL,
+  recorded_locally_at TEXT,
+  recorded_at_server_time TEXT NOT NULL,
+  payload_json TEXT,
+  sync_batch_id TEXT
+);
+
+CREATE TABLE conflicts (
+  conflict_id TEXT PRIMARY KEY,
+  conflict_type TEXT NOT NULL,
+  worker_id TEXT,
+  device_id TEXT,
+  related_event_ids TEXT NOT NULL,
+  detected_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open',
+  details_json TEXT
+);
+
+CREATE TABLE session_projection (
+  session_id TEXT PRIMARY KEY,
+  worker_id TEXT NOT NULL,
+  job_id TEXT,
+  start_time TEXT,
+  end_time TEXT,
+  duration_seconds INTEGER,
+  state TEXT NOT NULL,
+  trust_status TEXT NOT NULL
+);
+```
+
+**Why SQLite for the server backend?**
+- Same database engine as the device, so consistent behavior
+- No setup complexity (just a file)
+- Sufficient for MVP and demo purposes
+- Conflict detection and projection logic are identical to device-side
+- If this ever moves to production, swapping in PostgreSQL is straightforward (only SQL syntax changes)
+
+## API Contract
+
+### POST /api/events/batch
+
+**Request:**
+```json
+{
+  "events": [
+    {
+      "eventId": "uuid-1",
+      "deviceId": "device-07",
+      "workerId": "worker-12",
+      "jobId": "job-88",
+      "sessionId": "session-abc-123",
+      "eventType": "WORK_STARTED",
+      "occurredAt": "2026-03-09T08:15:00Z",
+      "recordedLocallyAt": "2026-03-09T08:15:03Z",
+      "payload": {}
+    }
+  ]
+}
+```
+
+**Response:**
+```json
+{
+  "accepted": ["uuid-1"],
+  "duplicates": [],
+  "rejected": [],
+  "newConflicts": [
+    {
+      "conflictId": "conflict-xyz",
+      "type": "WORKER_OVERLAP",
+      "relatedEventIds": ["uuid-1", "uuid-2"]
+    }
+  ]
+}
+```
+
+### GET /api/audit/worker/:workerId
+
+Returns timeline of events for a worker.
+
+### GET /api/audit/job/:jobId
+
+Returns timeline of events for a job.
+
+### GET /api/conflicts
+
+Returns list of all flagged conflicts.
+
+## Explicit Non-Goals (MVP Scope)
+
+❌ User authentication
+❌ Permission system
+❌ Real-time synchronization (polling is fine)
+❌ Supervisor conflict resolution workflows (just visibility)
+❌ Automatic conflict resolution
+❌ Device enrollment / device management
+❌ Fancy UI or design system
+❌ Background sync (manual "Sync Now" button is acceptable)
+
+These can be added post-MVP without changing the core event model.
+
+## Key Design Decisions
+
+### Why Event Sourcing?
+
+Event sourcing fits this problem because:
+1. Spec explicitly requires immutability
+2. Offline devices mean conflicting claims are expected
+3. Audit trail is the primary requirement
+4. Derived state (current worker, active job) is secondary
+
+### Why Preserve Conflicts Instead of Prevent?
+
+Offline reality: devices cannot talk to each other or the server in real-time. Any attempt to prevent conflicts (e.g., "reject starts if worker already active") would require perfect connectivity, which you don't have.
+
+Better: preserve all claims, flag contradictions, let supervisors review.
+
+### Why Separate Sessions From Events?
+
+Sessions (start/stop pairs) are read model concerns. The source of truth is the two events. Storing a separate "session" table creates redundancy and the risk of desync.
+
+Solution: derive sessions from event pairs during projection.
+
+### Why Both Device Time and Server Time?
+
+Device time reflects the worker's experience ("I really did start at 9:00 AM").
+Server time reflects the audit order ("the server received this claim at 10:15 AM").
+
+Both matter for different audit purposes.
+
+### Why SQLite Locally, Not Firebase?
+
+SQLite:
+- Works offline without any setup
+- Simple, predictable sync model
+- Cheap to implement conflict detection
+- No dependency on external service
+- Good for teaching system thinking
+
+Firebase Firestore:
+- Easier to build on, but...
+- Conflict model is less explicit
+- Harder to demonstrate "immutable append-only" design
+- More of a black box
+
+For this interview, demonstrating clear architectural thinking matters more than speed.
+
+## Assumptions
+
+- Workers are identified via supervisor entry or PIN, not biometric identity.
+- Device clocks may drift; both device time and server receipt time are stored.
+- One worker should normally have at most one active session at a time.
+- Conflicting events are preserved and flagged, not auto-resolved.
+- Server time is the authoritative ordering for audit records.
+- Sync is idempotent by event_id.
+- Device handoff is represented as: previous worker stops, next worker starts.
+- Supervisors review conflicts; system does not auto-resolve them.
+- App target platforms: Android and iOS (mobile-first).
+
+## Timeline
+
+- Days 1–2: Design lock (you're here)
+- Days 3–4: Local event capture
+- Days 5: Backend event store
+- Days 6: Sync engine
+- Days 7: Conflict detection
+- Days 8: Supervisor view
+- Days 9: Testing
+- Days 10: Documentation & recording
+
+## Artifacts to Build
+
+- `factory_audit/` — Flutter project
+- `backend/` — API + server database
+- `docs/` — architecture, assumptions, design decisions
+- `demo_walkthrough.mp4` — recording
+
+## Success Criteria
+
+You will know this is working when:
+
+1. ✅ Worker can start/stop job offline; events are captured locally
+2. ✅ When online, events sync to backend without mutation
+3. ✅ Backend appends events immutably
+4. ✅ Overlapping sessions on same worker are detected and flagged
+5. ✅ Overlapping sessions on same device are detected and flagged
+6. ✅ Supervisor sees conflict list with original events preserved
+7. ✅ You can explain the design tradeoffs clearly
+8. ✅ You can articulate where a design suggestion (AI or otherwise) was wrong and how you caught it
