@@ -114,19 +114,64 @@ This document clarifies what the system assumes and what it deliberately does NO
 
 ---
 
-### 7. Server Time Is Authoritative for Ordering
+### 7. Dual-Perspective Timestamps
 
-**Assumption:** When reconstructing an audit timeline, server receipt order is the truth.
+**Assumption:** Every event carries two timestamps:
+- `occurred_at` (device's claim about when it happened)
+- `recorded_at_server_time` (server's claim about when it learned about it)
 
 **Implication:**
-- Supervisor audit view orders events by `recorded_at_server_time`
-- If two events have same device time but different server times, server time is the canonical order
-- This can show where sync order doesn't match device observation order
+- **For audit ordering:** Server uses `recorded_at_server_time` (canonical ingestion order)
+- **For conflict detection:** Server sorts by `recorded_at_server_time` to determine sequence
+- **For supervisor view:** Both timestamps are shown, so supervisor sees both worker perspective and server perspective
+- **For timeline reconstruction:** Supervisor can reconstruct what the worker *experienced* (via `occurred_at`) vs. what the server *recorded* (via `recorded_at_server_time`)
 
 **Why:**
-- Server is the single source of truth for the canonical audit log
-- Device times might be out of order (clock drift, batch sync)
-- Allows detection of device tampering or significant clock drift
+- Server time is authoritative for the canonical audit log ordering
+- Device time is honest about what the worker/device *claimed* happened
+- Together they enable forensic understanding (e.g., "device was offline for 18 hours")
+- Allows detection of clock drift without rewriting history
+- Supervisor can see both perspectives and make informed judgments
+
+---
+
+### 7.5. Timestamp Usage: Two Different Purposes
+
+To remove any ambiguity, here's exactly how each timestamp is used:
+
+**`occurred_at` (Device Time):**
+- **Used for:** Reconstructing the claimed worker/device timeline
+- **Used in:** Supervisor views (shows what worker experienced)
+- **NOT used for:** Conflict detection ordering or audit log sequencing
+- **Reason:** Allows supervisor to understand device perspective even if clock drifted
+
+**`recorded_at_server_time` (Server Time):**
+- **Used for:** Canonical audit log ordering
+- **Used for:** Conflict detection (all sorts are by this field)
+- **Used in:** Determining sequence of events in authoritative log
+- **Reason:** Server is single source of truth; this proves when claim arrived
+
+**In Supervisor UI, show both:**
+```
+WORK_STARTED | Worker: Alice | Job: Assembly12
+  Worker's device said: 2024-03-08 @ 13:55
+  Server recorded at: 2024-03-08 @ 14:10
+  [Interpretation: Device was offline for ~15 minutes before sync]
+
+[If timeline has conflict]:
+WORK_STARTED | Worker: Bob | Job: Welding5
+  Worker's device said: 2024-03-08 @ 13:57
+  Server recorded at: 2024-03-08 @ 14:12
+  
+⚠️ CONFLICT: Alice and Bob both have overlapping sessions
+  (determined by server receipt times 14:10 and 14:12)
+  But check device times: Alice claims 13:55, Bob claims 13:57
+  - If both correct, real overlap is ~2 minutes
+  - If Alice's device was drifting, overlap might be different
+  Supervisor must review.
+```
+
+This dual perspective is the whole point of storing both timestamps.
 
 ---
 
@@ -147,23 +192,7 @@ This document clarifies what the system assumes and what it deliberately does NO
 
 ---
 
-### 9. Device Handoff Semantics
 
-**Assumption:** Device handoff is represented as: previous worker stops, next worker starts (two separate events).
-
-**Implication:**
-- No explicit "DEVICE_HANDOFF" event needed for MVP
-- Handoff is implicit in the stop/start sequence
-- If handoff goes wrong (worker doesn't stop before handing device), it creates DEVICE_OVERLAP conflict
-
-**Why:**
-- Simpler than explicit handoff events
-- Attribution is clear (each worker owns their events)
-- Conflicts from bad handoffs are still detected
-
----
-
-### 10. Offline Persistence
 
 **Assumption:** When device goes offline, all events created locally are persisted in SQLite and will eventually sync when connectivity returns.
 
